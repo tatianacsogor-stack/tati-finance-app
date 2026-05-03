@@ -3,13 +3,186 @@ from io import BytesIO
 import sqlite3
 
 import pandas as pd
+from PIL import Image
 try:
     import plotly.express as px
 except ImportError:
     px = None
 import streamlit as st
+import streamlit.components.v1 as components
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
 
-st.set_page_config(page_title="Tati Finance", page_icon="$", layout="wide")
+icon = Image.open("icon.png")
+
+st.set_page_config(
+    page_title="Tati Finance",
+    page_icon=icon,
+    layout="wide",
+)
+
+# --- Password protection ---
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+try:
+    APP_PASSWORD = st.secrets["APP_PASSWORD"]
+except Exception:
+    st.error("APP_PASSWORD is missing. Add it in Streamlit Secrets.")
+    st.stop()
+
+# 🔐 LOGIN SCREEN
+if not st.session_state["logged_in"]:
+    st.title("🔐 Tati Finance Login")
+
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if password == APP_PASSWORD:
+            st.session_state["logged_in"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()  
+
+# ✅ NOW it's in the correct place
+
+# 🔓 AFTER LOGIN
+if st.session_state["logged_in"]:
+    if st.button("Logout"):
+        st.session_state["logged_in"] = False
+        st.rerun()
+
+components.html(
+    """
+    <script>
+    const iconHref = new URL("app/static/icon.png", window.parent.location.href).href;
+    const parentDocument = window.parent.document;
+
+    function upsertIconLink(rel) {
+        let link = parentDocument.querySelector(`link[rel="${rel}"]`);
+        if (!link) {
+            link = parentDocument.createElement("link");
+            link.setAttribute("rel", rel);
+            parentDocument.head.appendChild(link);
+        }
+        link.setAttribute("href", iconHref);
+        link.setAttribute("sizes", "180x180");
+        link.setAttribute("type", "image/png");
+    }
+
+    upsertIconLink("apple-touch-icon");
+    upsertIconLink("icon");
+    </script>
+    """,
+    height=0,
+)
+
+st.markdown(
+    """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def get_supabase_client():
+    if create_client is None:
+        st.error("Supabase is not installed yet.")
+        st.info("Install the app requirements again with: pip install -r requirements.txt")
+        st.stop()
+
+    try:
+        supabase_url = str(st.secrets["SUPABASE_URL"]).strip()
+        supabase_key = str(st.secrets["SUPABASE_KEY"]).strip()
+    except KeyError as error:
+        missing_name = str(error).strip("'\"")
+        st.error(f"Supabase is missing {missing_name} in Streamlit secrets.")
+        st.info("Add SUPABASE_URL and SUPABASE_KEY to .streamlit/secrets.toml, then restart the app.")
+        st.stop()
+
+    if not supabase_url or not supabase_key:
+        st.error("Supabase is not connected yet.")
+        st.info("Add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets, then restart the app.")
+        st.stop()
+
+    if supabase_key.startswith("sb_publishable_"):
+        st.error("This app needs the legacy anon public key, not the new publishable key.")
+        st.info(
+            "In Supabase, go to Settings -> API -> Legacy anon, service_role API keys, "
+            "then copy the anon public key into SUPABASE_KEY. Do not use the service_role key."
+        )
+        st.stop()
+
+    if not supabase_key.startswith("eyJ"):
+        st.error("SUPABASE_KEY does not look like a legacy anon public key.")
+        st.info(
+            "Use the key that starts with eyJ from Supabase -> Settings -> API -> "
+            "Legacy anon, service_role API keys -> anon public. Do not use service_role."
+        )
+        st.stop()
+
+    try:
+        client = create_client(supabase_url, supabase_key)
+        client.table("cash_flow_entries").select("id").limit(1).execute()
+        return client
+    except Exception as error:
+        st.error("Supabase could not connect.")
+        st.info("Please check SUPABASE_URL, the legacy anon public key, and that the cash_flow_entries table exists.")
+        with st.expander("Technical details"):
+            st.code(str(error))
+        st.stop()
+
+
+supabase = None
+
+
+# Login section starts
+def get_app_password():
+    try:
+        return str(st.secrets["APP_PASSWORD"])
+    except KeyError:
+        st.error("APP_PASSWORD is missing from Streamlit secrets.")
+        st.info('Add APP_PASSWORD = "my-password-here" to your Streamlit Cloud secrets.')
+        st.stop()
+
+
+def show_login_screen():
+    app_password = get_app_password()
+
+    st.markdown(
+        """
+        <div class="top-header">
+            <h1 class="app-title">Tati Finance</h1>
+            <div class="app-subtitle">Enter your password to view your dashboard</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("password_login_form"):
+        password = st.text_input("Password", type="password")
+        login_clicked = st.form_submit_button("Login")
+
+    if login_clicked:
+        if password == app_password:
+            st.session_state["logged_in"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+
+def logout_user():
+    st.session_state["logged_in"] = False
+# Login section ends
+
 
 st.markdown("""
 <style>
@@ -463,15 +636,16 @@ def migrate_old_cash_flow(conn):
 
 
 def load_cash_flow():
-    with connect() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT id, month, type, source, amount, notes, created_at
-            FROM cash_flow
-            ORDER BY month DESC, id DESC
-            """,
-            conn,
-        )
+    response = (
+        supabase
+        .table("cash_flow")
+        .select("id, month, type, source, amount, notes, created_at")
+        .order("month", desc=True)
+        .order("id", desc=True)
+        .execute()
+    )
+
+    return pd.DataFrame(response.data or [])
 
 
 def load_table_if_exists(table_name):
@@ -2280,8 +2454,22 @@ def show_history(cash_flow, spending_entries, steven, savings, plans, show_title
 
 
 def main():
+    global supabase
+
     init_db()
     apply_styles()
+
+    # Login section starts
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+
+    if not st.session_state["logged_in"]:
+        show_login_screen()
+        return
+    # Login section ends
+
+    if supabase is None:
+        supabase = get_supabase_client()
 
     cash_flow = load_cash_flow()
     spending_entries = load_spending_entries()
@@ -2298,6 +2486,15 @@ def main():
         """,
         unsafe_allow_html=True,
     )
+
+    if st.button("Logout", key="logout_button"):
+        logout_user()
+        st.rerun()
+
+    with st.sidebar:
+        if st.button("Logout", key="sidebar_logout_button"):
+            logout_user()
+            st.rerun()
 
     (
         dashboard_tab,
