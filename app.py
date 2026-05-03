@@ -11,15 +11,20 @@ except ImportError:
 import streamlit as st
 import streamlit.components.v1 as components
 try:
-    from supabase import create_client
+    from supabase import create_client, Client
+
+supabase: Client = create_client(
+    st.secrets["SUPABASE_URL"],
+    st.secrets["SUPABASE_KEY"]
+)
 except ImportError:
     create_client = None
 
-icon = Image.open("icon.png")
+icon=Image.open("icon.png")
 
 st.set_page_config(
-    page_title="Tati Finance",
     page_icon=icon,
+    page_title="Tati Finance",
     layout="wide",
 )
 
