@@ -1,7 +1,5 @@
 from datetime import date, datetime, timedelta
 from io import BytesIO
-import sqlite3
-
 import pandas as pd
 from PIL import Image
 try:
@@ -11,55 +9,20 @@ except ImportError:
 import streamlit as st
 import streamlit.components.v1 as components
 try:
-    from supabase import create_client, Client
-
-supabase: Client = create_client(
-    st.secrets["SUPABASE_URL"],
-    st.secrets["SUPABASE_KEY"]
-)
+    from supabase import create_client
 except ImportError:
     create_client = None
 
-icon=Image.open("icon.png")
+try:
+    icon = Image.open("icon.png")
+except Exception:
+    icon = "💰"
 
 st.set_page_config(
     page_icon=icon,
     page_title="Tati Finance",
     layout="wide",
 )
-
-# --- Password protection ---
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-
-try:
-    APP_PASSWORD = st.secrets["APP_PASSWORD"]
-except Exception:
-    st.error("APP_PASSWORD is missing. Add it in Streamlit Secrets.")
-    st.stop()
-
-# 🔐 LOGIN SCREEN
-if not st.session_state["logged_in"]:
-    st.title("🔐 Tati Finance Login")
-
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        if password == APP_PASSWORD:
-            st.session_state["logged_in"] = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-
-    st.stop()  
-
-# ✅ NOW it's in the correct place
-
-# 🔓 AFTER LOGIN
-if st.session_state["logged_in"]:
-    if st.button("Logout"):
-        st.session_state["logged_in"] = False
-        st.rerun()
 
 components.html(
     """
@@ -136,11 +99,11 @@ def get_supabase_client():
 
     try:
         client = create_client(supabase_url, supabase_key)
-        client.table("cash_flow_entries").select("id").limit(1).execute()
+        client.table("cash_flow").select("id").limit(1).execute()
         return client
     except Exception as error:
         st.error("Supabase could not connect.")
-        st.info("Please check SUPABASE_URL, the legacy anon public key, and that the cash_flow_entries table exists.")
+        st.info("Please check SUPABASE_URL, the legacy anon public key, and that the cash_flow table exists.")
         with st.expander("Technical details"):
             st.code(str(error))
         st.stop()
@@ -237,8 +200,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DB_NAME = "expenses.db"
-DB_FILE = DB_NAME
 
 SOURCES = [
     "Cash",
@@ -380,9 +341,24 @@ MONEY_OUT_TYPES = {
 }
 
 
-def connect():
-    return sqlite3.connect(DB_FILE)
+def require_supabase():
+    global supabase
+    if supabase is None:
+        supabase = get_supabase_client()
+    return supabase
 
+
+def supabase_df(table_name, columns="*", order_by=None, desc=True):
+    client = require_supabase()
+    query = client.table(table_name).select(columns)
+    if order_by:
+        if isinstance(order_by, (list, tuple)):
+            for col in order_by:
+                query = query.order(col, desc=desc)
+        else:
+            query = query.order(order_by, desc=desc)
+    response = query.execute()
+    return pd.DataFrame(response.data or [])
 
 def money(value):
     return f"${float(value or 0):,.2f}"
@@ -437,19 +413,16 @@ def month_matches(series, month):
     return series.astype(str).apply(normalize_month) == normalized_month
 
 
-def table_exists(conn, table_name):
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
+def table_exists(table_name):
+    try:
+        require_supabase().table(table_name).select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
 
-
-def ensure_column(conn, table_name, column_name, column_type):
-    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
-    if column_name not in columns:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
-
+def ensure_column(*args, **kwargs):
+    # Supabase schema is managed in Supabase, not inside Streamlit.
+    return None
 
 def normalize_entry_type(entry_type):
     return "income" if str(entry_type).strip().lower() == "income" else "expense"
@@ -468,285 +441,67 @@ def display_entry_type(entry_type):
 
 
 def init_db():
-    with connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cash_flow (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                month TEXT NOT NULL,
-                type TEXT NOT NULL,
-                source TEXT NOT NULL,
-                amount REAL NOT NULL,
-                notes TEXT,
-                created_at TEXT NOT NULL,
-                legacy_table TEXT,
-                legacy_id INTEGER
-            )
-            """
-        )
-        ensure_column(conn, "cash_flow", "legacy_table", "TEXT")
-        ensure_column(conn, "cash_flow", "legacy_id", "INTEGER")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_flow_legacy ON cash_flow (legacy_table, legacy_id)"
-        )
+    # No local SQLite database. Data is stored permanently in Supabase.
+    require_supabase()
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS steven_calculations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                month TEXT NOT NULL,
-                tax_quarterly REAL NOT NULL DEFAULT 0,
-                tax_monthly_share REAL NOT NULL DEFAULT 0,
-                mortgage_monthly REAL NOT NULL DEFAULT 0,
-                mortgage_share REAL NOT NULL DEFAULT 0,
-                health_insurance REAL NOT NULL DEFAULT 0,
-                car_house_insurance REAL NOT NULL DEFAULT 0,
-                house_cleaning REAL NOT NULL DEFAULT 0,
-                other_deductions REAL NOT NULL DEFAULT 0,
-                total_before_deductions REAL NOT NULL DEFAULT 0,
-                total_deductions REAL NOT NULL DEFAULT 0,
-                final_amount REAL NOT NULL DEFAULT 0,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        for column, column_type in {
-            "tax_quarterly": "REAL NOT NULL DEFAULT 0",
-            "tax_monthly_share": "REAL NOT NULL DEFAULT 0",
-            "mortgage_monthly": "REAL NOT NULL DEFAULT 0",
-            "mortgage_share": "REAL NOT NULL DEFAULT 0",
-            "health_insurance": "REAL NOT NULL DEFAULT 0",
-            "car_house_insurance": "REAL NOT NULL DEFAULT 0",
-            "house_cleaning": "REAL NOT NULL DEFAULT 0",
-            "other_deductions": "REAL NOT NULL DEFAULT 0",
-            "total_before_deductions": "REAL NOT NULL DEFAULT 0",
-            "total_deductions": "REAL NOT NULL DEFAULT 0",
-            "final_amount": "REAL NOT NULL DEFAULT 0",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-        }.items():
-            ensure_column(conn, "steven_calculations", column, column_type)
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS savings_tracker (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                month TEXT NOT NULL,
-                current_balance REAL NOT NULL,
-                savings_goal REAL NOT NULL,
-                added_this_month REAL NOT NULL,
-                taken_this_month REAL NOT NULL,
-                net_change REAL NOT NULL,
-                remaining_to_goal REAL NOT NULL,
-                progress REAL NOT NULL,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS spending_category_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_date TEXT,
-                month TEXT NOT NULL,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL,
-                paid_with TEXT NOT NULL,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        ensure_column(conn, "spending_category_entries", "entry_date", "TEXT")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payment_plans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                plan_name TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                purchase_category TEXT NOT NULL,
-                original_amount REAL NOT NULL,
-                payment_amount REAL NOT NULL,
-                payment_frequency TEXT NOT NULL,
-                total_payments INTEGER NOT NULL,
-                payments_made INTEGER NOT NULL,
-                start_date TEXT NOT NULL,
-                notes TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        migrate_old_cash_flow(conn)
-
-
-def migrate_old_cash_flow(conn):
-    if table_exists(conn, "cash_flow_entries"):
-        rows = conn.execute(
-            """
-            SELECT id, month, type, amount, source_account, notes, created_at
-            FROM cash_flow_entries
-            """
-        ).fetchall()
-        for row in rows:
-            row_id, month, entry_type, amount, source, notes, created_at = row
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO cash_flow
-                    (month, type, source, amount, notes, created_at, legacy_table, legacy_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    month,
-                    normalize_entry_type(entry_type),
-                    source or "Other",
-                    abs(float(amount or 0)),
-                    notes or "",
-                    created_at or datetime.now().isoformat(),
-                    "cash_flow_entries",
-                    row_id,
-                ),
-            )
-
-    if table_exists(conn, "transactions"):
-        rows = conn.execute(
-            """
-            SELECT id, date, type, amount, payment_method, description
-            FROM transactions
-            """
-        ).fetchall()
-        for row in rows:
-            row_id, txn_date, entry_type, amount, source, notes = row
-            month = str(txn_date)[:7]
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO cash_flow
-                    (month, type, source, amount, notes, created_at, legacy_table, legacy_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    month,
-                    normalize_entry_type(entry_type),
-                    source or "Other",
-                    abs(float(amount or 0)),
-                    notes or "",
-                    datetime.now().isoformat(),
-                    "transactions",
-                    row_id,
-                ),
-            )
-
+def migrate_old_cash_flow(*args, **kwargs):
+    # Legacy SQLite migration disabled in cloud mode.
+    return None
 
 def load_cash_flow():
-    response = (
-        supabase
-        .table("cash_flow")
-        .select("id, month, type, source, amount, notes, created_at")
-        .order("month", desc=True)
-        .order("id", desc=True)
-        .execute()
+    return supabase_df(
+        "cash_flow",
+        "id, month, type, source, amount, notes, created_at",
+        order_by=["month", "id"],
+        desc=True,
     )
 
-    return pd.DataFrame(response.data or [])
-
-
 def load_table_if_exists(table_name):
-    with connect() as conn:
-        if not table_exists(conn, table_name):
-            return pd.DataFrame()
-        return pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
-
+    try:
+        return supabase_df(table_name)
+    except Exception:
+        return pd.DataFrame()
 
 def load_spending_entries():
-    with connect() as conn:
-        if not table_exists(conn, "spending_category_entries"):
-            return pd.DataFrame(
-                columns=["id", "month", "category", "amount", "paid_with", "notes", "created_at"]
-            )
-        return pd.read_sql_query(
-            """
-            SELECT id, entry_date, month, category, amount, paid_with, notes, created_at
-            FROM spending_category_entries
-            ORDER BY month DESC, id DESC
-            """,
-            conn,
+    try:
+        return supabase_df(
+            "spending_category_entries",
+            "id, entry_date, month, category, amount, paid_with, notes, created_at",
+            order_by=["month", "id"],
+            desc=True,
         )
-
+    except Exception:
+        return pd.DataFrame(columns=["id", "entry_date", "month", "category", "amount", "paid_with", "notes", "created_at"])
 
 def add_spending_entry(entry_date, month, category, amount, paid_with, notes):
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO spending_category_entries
-                (entry_date, month, category, amount, paid_with, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                entry_date,
-                month,
-                category,
-                abs(float(amount or 0)),
-                paid_with,
-                notes,
-                datetime.now().isoformat(),
-            ),
-        )
-
+    require_supabase().table("spending_category_entries").insert({
+        "entry_date": entry_date,
+        "month": month,
+        "category": category,
+        "amount": abs(float(amount or 0)),
+        "paid_with": paid_with,
+        "notes": notes,
+        "created_at": datetime.now().isoformat(),
+    }).execute()
 
 def delete_spending_entry(entry_id):
-    with connect() as conn:
-        conn.execute("DELETE FROM spending_category_entries WHERE id = ?", (entry_id,))
-        conn.commit()
-
+    require_supabase().table("spending_category_entries").delete().eq("id", int(entry_id)).execute()
 
 def add_cash_flow(month, entry_type, source, amount, notes):
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO cash_flow (month, type, source, amount, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                month,
-                normalize_entry_type(entry_type),
-                source,
-                abs(float(amount or 0)),
-                notes,
-                datetime.now().isoformat(),
-            ),
-        )
-
+    require_supabase().table("cash_flow").insert({
+        "month": month,
+        "type": normalize_entry_type(entry_type),
+        "source": source,
+        "amount": abs(float(amount or 0)),
+        "notes": notes,
+        "created_at": datetime.now().isoformat(),
+    }).execute()
 
 def delete_cash_flow(entry_id):
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT legacy_table, legacy_id FROM cash_flow WHERE id = ?",
-            (entry_id,),
-        ).fetchone()
-        conn.execute("DELETE FROM cash_flow WHERE id = ?", (entry_id,))
-        if row:
-            legacy_table, legacy_id = row
-            if legacy_table == "cash_flow_entries" and legacy_id is not None:
-                conn.execute("DELETE FROM cash_flow_entries WHERE id = ?", (legacy_id,))
-            elif legacy_table == "transactions" and legacy_id is not None:
-                conn.execute("DELETE FROM transactions WHERE id = ?", (legacy_id,))
-        conn.commit()
-
+    require_supabase().table("cash_flow").delete().eq("id", int(entry_id)).execute()
 
 def load_steven():
-    with connect() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT *
-            FROM steven_calculations
-            ORDER BY month DESC, id DESC
-            """,
-            conn,
-        )
-
+    return supabase_df("steven_calculations", "*", order_by=["month", "id"], desc=True)
 
 def steven_breakdown(tax_quarterly, mortgage_monthly, health, insurance, cleaning, other):
     tax_share = tax_quarterly / 3 / 2
@@ -766,42 +521,25 @@ def save_steven(month, tax_quarterly, mortgage_monthly, health, insurance, clean
         cleaning,
         other,
     )
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO steven_calculations
-                (
-                    month, tax_quarterly, tax_monthly_share, mortgage_monthly,
-                    mortgage_share, health_insurance, car_house_insurance,
-                    house_cleaning, other_deductions, total_before_deductions,
-                    total_deductions, final_amount, notes, created_at
-                )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                month,
-                tax_quarterly,
-                tax_share,
-                mortgage_monthly,
-                mortgage_share,
-                health,
-                insurance,
-                cleaning,
-                other,
-                before_deductions,
-                deductions,
-                final_amount,
-                notes,
-                datetime.now().isoformat(),
-            ),
-        )
-
+    require_supabase().table("steven_calculations").insert({
+        "month": month,
+        "tax_quarterly": float(tax_quarterly or 0),
+        "tax_monthly_share": float(tax_share or 0),
+        "mortgage_monthly": float(mortgage_monthly or 0),
+        "mortgage_share": float(mortgage_share or 0),
+        "health_insurance": float(health or 0),
+        "car_house_insurance": float(insurance or 0),
+        "house_cleaning": float(cleaning or 0),
+        "other_deductions": float(other or 0),
+        "total_before_deductions": float(before_deductions or 0),
+        "total_deductions": float(deductions or 0),
+        "final_amount": float(final_amount or 0),
+        "notes": notes,
+        "created_at": datetime.now().isoformat(),
+    }).execute()
 
 def delete_steven_calculation(calculation_id):
-    with connect() as conn:
-        conn.execute("DELETE FROM steven_calculations WHERE id = ?", (calculation_id,))
-        conn.commit()
-
+    require_supabase().table("steven_calculations").delete().eq("id", int(calculation_id)).execute()
 
 def build_steven_pdf(month, tax, mortgage, health, insurance, cleaning, other, notes):
     tax_share, mortgage_share, before_deductions, deductions, final_amount = steven_breakdown(
@@ -870,52 +608,27 @@ def latest_steven_for_month(records, month):
 
 
 def load_savings():
-    with connect() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT *
-            FROM savings_tracker
-            ORDER BY month DESC, id DESC
-            """,
-            conn,
-        )
-
+    return supabase_df("savings_tracker", "*", order_by=["month", "id"], desc=True)
 
 def save_savings(month, balance, goal, added, taken, notes):
     net = added - taken
     remaining = max(goal - balance, 0)
     progress = (balance / goal * 100) if goal > 0 else 0
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO savings_tracker
-                (
-                    month, current_balance, savings_goal, added_this_month,
-                    taken_this_month, net_change, remaining_to_goal, progress,
-                    notes, created_at
-                )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                month,
-                balance,
-                goal,
-                added,
-                taken,
-                net,
-                remaining,
-                min(progress, 100),
-                notes,
-                datetime.now().isoformat(),
-            ),
-        )
-
+    require_supabase().table("savings_tracker").insert({
+        "month": month,
+        "current_balance": float(balance or 0),
+        "savings_goal": float(goal or 0),
+        "added_this_month": float(added or 0),
+        "taken_this_month": float(taken or 0),
+        "net_change": float(net or 0),
+        "remaining_to_goal": float(remaining or 0),
+        "progress": float(min(progress, 100)),
+        "notes": notes,
+        "created_at": datetime.now().isoformat(),
+    }).execute()
 
 def delete_savings_record(record_id):
-    with connect() as conn:
-        conn.execute("DELETE FROM savings_tracker WHERE id = ?", (record_id,))
-        conn.commit()
-
+    require_supabase().table("savings_tracker").delete().eq("id", int(record_id)).execute()
 
 def latest_savings_for_month(records, month):
     if records.empty:
@@ -927,54 +640,29 @@ def latest_savings_for_month(records, month):
 
 
 def load_payment_plans():
-    with connect() as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT *
-            FROM payment_plans
-            ORDER BY id DESC
-            """,
-            conn,
-        )
-    if not df.empty:
+    df = supabase_df("payment_plans", "*", order_by="id", desc=True)
+    if not df.empty and "start_date" in df.columns:
         df["start_date"] = pd.to_datetime(df["start_date"]).dt.date
     return df
 
-
 def save_payment_plan(plan_name, provider, category, original, frequency, total, made, start_date, notes):
     payment_amount = original / total
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO payment_plans
-                (
-                    plan_name, provider, purchase_category, original_amount,
-                    payment_amount, payment_frequency, total_payments,
-                    payments_made, start_date, notes, created_at
-                )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                plan_name,
-                provider,
-                category,
-                original,
-                payment_amount,
-                frequency,
-                total,
-                made,
-                start_date.isoformat(),
-                notes,
-                datetime.now().isoformat(),
-            ),
-        )
-
+    require_supabase().table("payment_plans").insert({
+        "plan_name": plan_name,
+        "provider": provider,
+        "purchase_category": category,
+        "original_amount": float(original or 0),
+        "payment_amount": float(payment_amount or 0),
+        "payment_frequency": frequency,
+        "total_payments": int(total or 0),
+        "payments_made": int(made or 0),
+        "start_date": start_date.isoformat(),
+        "notes": notes,
+        "created_at": datetime.now().isoformat(),
+    }).execute()
 
 def delete_payment_plan(plan_id):
-    with connect() as conn:
-        conn.execute("DELETE FROM payment_plans WHERE id = ?", (plan_id,))
-        conn.commit()
-
+    require_supabase().table("payment_plans").delete().eq("id", int(plan_id)).execute()
 
 def payment_plan_numbers(row):
     total = int(row["total_payments"])
